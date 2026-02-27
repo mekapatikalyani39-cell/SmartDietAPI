@@ -4,6 +4,16 @@
     {
         public record RegisterReq(string FullName, string Email, string Password);
         public record LoginReq(string Email, string Password);
-        public record AuthResp(bool IsSuccess, string? Message, int? UserId, string? Role);
+        //public record AuthResp(bool IsSuccess, string? Message, int? UserId, string? Role);
+        public record AuthResp(
+    bool IsSuccess,
+    string? Message,
+    int? UserId,
+    string? Role,
+    bool HasProfile,
+    bool HasActivePlan,
+    string NextStep
+);
+
     }
 }

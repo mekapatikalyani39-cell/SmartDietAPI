@@ -19,7 +19,15 @@ namespace SmartDietAPI.Controllers
         public async Task<IActionResult> Register(RegisterReq req)
         {
             var resp = await _auth.Register(req);
-            return resp.IsSuccess ? Ok(resp) : BadRequest(resp);
+
+            if (!resp.IsSuccess)
+                return BadRequest(resp);
+
+            // Auto-login after successful registration
+            HttpContext.Session.SetInt32(SessionKeys.UserId, resp.UserId!.Value);
+            HttpContext.Session.SetString(SessionKeys.Role, resp.Role!);
+
+            return Ok(resp);
         }
 
         [HttpPost("login")]
