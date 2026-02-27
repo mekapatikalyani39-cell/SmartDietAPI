@@ -1,337 +1,564 @@
 ﻿using Microsoft.EntityFrameworkCore;
 using SmartDietAPI.Models;
-namespace SmartDietAPI.Repository
+using static SmartDietAPI.Dto.PlanDtos;
+
+public class PlanService
 {
-    public class PlanService
+    private readonly AppDbContext _db;
+    public PlanService(AppDbContext db) => _db = db;
+
+    // ---------------------------------------------------------
+    // PREVIEW ONLY (does not save)
+    // ---------------------------------------------------------
+    public async Task<PlanPreviewResp> PreviewPlan(int userId, int goalId)
     {
-        private readonly AppDbContext _db;
-        public PlanService(AppDbContext db) => _db = db;
+        var profile = await _db.UserProfiles.FirstOrDefaultAsync(p => p.UserId == userId)
+                      ?? throw new Exception("User profile not found.");
 
-        public async Task<object> GeneratePlan(int userId, int goalId)
+        var goal = await _db.UserGoals.FirstOrDefaultAsync(g => g.GoalId == goalId && g.UserId == userId)
+                   ?? throw new Exception("Goal not found.");
+
+        var calc = BuildPlanCalculation(profile, goal);
+
+        var weekPlan = await BuildPreviewWeekPlan(profile, goal);
+
+        return new PlanPreviewResp(
+            calc.CaloriesTarget,
+            calc.ProteinG,
+            calc.CarbsG,
+            calc.FatG,
+            weekPlan
+        );
+    }
+
+    // ---------------------------------------------------------
+    // SAVE FINAL CUSTOMIZED PLAN
+    // ---------------------------------------------------------
+    public async Task<object> SaveCustomizedPlan(int userId, SaveCustomizedPlanReq req)
+    {
+        var profile = await _db.UserProfiles.FirstOrDefaultAsync(p => p.UserId == userId)
+                      ?? throw new Exception("User profile not found.");
+
+        var goal = await _db.UserGoals.FirstOrDefaultAsync(g => g.GoalId == req.GoalId && g.UserId == userId)
+                   ?? throw new Exception("Goal not found.");
+
+        // deactivate existing active plan
+        var activePlan = await _db.Plans
+            .Where(p => p.UserId == userId && p.IsActive)
+            .OrderByDescending(p => p.GeneratedOn)
+            .FirstOrDefaultAsync();
+
+        int nextVersion = 1;
+        if (activePlan != null)
         {
-            var profile = await _db.UserProfiles.SingleAsync(p => p.UserId == userId);
-            var goal = await _db.UserGoals.SingleAsync(g => g.GoalId == goalId && g.UserId == userId);
-
-            // deactivate old active plan
-            var activePlan = await _db.Plans.FirstOrDefaultAsync(p => p.UserId == userId && p.IsActive);
-            int nextVersion = 1;
-            if (activePlan != null)
-            {
-                activePlan.IsActive = false;
-                activePlan.ValidTo = DateOnly.FromDateTime(DateTime.UtcNow);
-                nextVersion = activePlan.PlanVersion + 1;
-            }
-
-            // calculations
-            var age = profile.DOB.HasValue ? CalcAge(profile.DOB.Value) : 25;
-            var heightM = (double)profile.HeightCm / 100.0;
-            var bmi = (double)profile.WeightKg / (heightM * heightM);
-
-            var bmr = CalcBmr(profile.Gender, (double)profile.WeightKg, (double)profile.HeightCm, age);
-            var tdee = (int)Math.Round(bmr * ActivityMultiplier(profile.ActivityLevel));
-
-            var caloriesTarget = CalcCaloriesTarget(goal.GoalType, goal.Pace, tdee, profile.Gender);
-            (int proteinG, int fatG, int carbsG) = CalcMacros(goal.GoalType, caloriesTarget, (double)profile.WeightKg);
-
-            var plan = new Plan
-            {
-                UserId = userId,
-                GoalId = goal.GoalId,
-                PlanVersion = nextVersion,
-                CaloriesTarget = caloriesTarget,
-                ProteinG = proteinG,
-                FatG = fatG,
-                CarbsG = carbsG,
-                Bmi = Math.Round((decimal)bmi, 2),
-                Bmr = (int)Math.Round(bmr),
-                Tdee = tdee,
-                IsActive = true,
-                ReasonForChange = nextVersion == 1 ? "Initial Plan" : "Regenerated",
-                ValidFrom = DateOnly.FromDateTime(DateTime.UtcNow)
-            };
-
-            _db.Plans.Add(plan);
-            await _db.SaveChangesAsync(); // need PlanId
-
-            // generate 7-day workout + diet items (template-ish)
-            await GenerateWorkoutItems(plan.PlanId, goal.GoalType, profile.WorkoutDaysPerWeek);
-            await GenerateDietItems(plan.PlanId, caloriesTarget, profile.MealsPerDay, profile.DietType);
-
-            await _db.SaveChangesAsync();
-
-            return new
-            {
-                plan.PlanId,
-                plan.PlanVersion,
-                plan.CaloriesTarget,
-                plan.ProteinG,
-                plan.CarbsG,
-                plan.FatG,
-                plan.Bmi,
-                plan.Bmr,
-                plan.Tdee
-            };
+            activePlan.IsActive = false;
+            activePlan.ValidTo = DateOnly.FromDateTime(DateTime.UtcNow);
+            nextVersion = activePlan.PlanVersion + 1;
         }
 
-        public async Task<object> AutoAdjust(int userId)
+        var calc = BuildPlanCalculation(profile, goal);
+
+        // Save the new final plan
+        var plan = new Plan
         {
-            var checkins = await _db.WeeklyCheckIns
-                .Where(x => x.UserId == userId)
-                .OrderByDescending(x => x.WeekStartDate)
-                .Take(3)
-                .ToListAsync();
+            UserId = userId,
+            GoalId = goal.GoalId,
+            PlanVersion = nextVersion,
+            CaloriesTarget = req.CaloriesTarget,
+            ProteinG = req.ProteinG,
+            CarbsG = req.CarbsG,
+            FatG = req.FatG,
+            Bmi = Math.Round((decimal)calc.Bmi, 2),
+            Bmr = calc.Bmr,
+            Tdee = calc.Tdee,
+            GeneratedOn = DateTime.UtcNow,
+            ValidFrom = DateOnly.FromDateTime(DateTime.UtcNow),
+            IsActive = true,
+            ReasonForChange = nextVersion == 1 ? "Initial Customized Plan" : "Customized Update"
+        };
 
-            var activePlan = await _db.Plans.FirstOrDefaultAsync(p => p.UserId == userId && p.IsActive);
-            var profile = await _db.UserProfiles.SingleAsync(p => p.UserId == userId);
-            var goal = await _db.UserGoals.FirstOrDefaultAsync(g => g.UserId == userId && g.IsActive);
+        _db.Plans.Add(plan);
+        await _db.SaveChangesAsync();
 
-            if (activePlan == null || goal == null) return new { message = "No active plan/goal" };
-            if (checkins.Count < 2) return new { message = "Need at least 2 weekly check-ins" };
+        // Save day-wise diet/workout selections
+        var week = req.WeekPlan ?? new List<WeekPlanDayReq>();
 
-            var adherence = checkins[0].AdherenceRating ?? 0;
-            if (adherence < 6) return new { message = "No adjustment (low adherence). Improve consistency first." };
-
-            var w0 = (double)checkins[0].WeightKg;
-            var w1 = (double)checkins[1].WeightKg;
-
-            var weeklyChange = w0 - w1; // negative means gained
-
-            // plateau: <0.3 kg change in 2 weeks (use last 2 weeks simple)
-            var isPlateau = Math.Abs(weeklyChange) < 0.3;
-
-            // too fast loss: >1% BW
-            var tooFastLoss = (w1 - w0) / w1 > 0.01; // positive if loss >1%
-                                                     // too fast gain: >0.75% BW
-            var tooFastGain = (w0 - w1) / w1 > 0.0075; // positive if gain >0.75%
-
-            int delta = 0;
-            string reason;
-
-            if (goal.GoalType == "Lose")
+        foreach (var day in week.Where(x => x.DayNo >= 1 && x.DayNo <= 7))
+        {
+            // Diet items
+            foreach (var item in (day.DietItems ?? new List<PlanDietRowReq>()))
             {
-                if (isPlateau) { delta = -150; reason = "Plateau detected"; }
-                else if (tooFastLoss) { delta = +150; reason = "Safety: losing too fast"; }
-                else return new { message = "No adjustment needed" };
+                if (string.IsNullOrWhiteSpace(item.FoodName) && !item.FoodId.HasValue)
+                    continue;
+
+                var resolvedFoodId = await ResolveOrCreateFoodAsync(item.FoodId, item.FoodName);
+
+                _db.PlanDietItems.Add(new PlanDietItem
+                {
+                    PlanId = plan.PlanId,
+                    DayNo = (byte)day.DayNo,
+                    MealType = string.IsNullOrWhiteSpace(item.MealType) ? "Breakfast" : item.MealType,
+                    FoodId = resolvedFoodId,
+                    Quantity = item.Quantity ?? 100,
+                    Notes = item.Notes
+                });
             }
-            else if (goal.GoalType == "Gain")
+
+            // Workout items
+            foreach (var item in (day.WorkoutItems ?? new List<PlanWorkoutRowReq>()))
             {
-                if (tooFastGain) { delta = -100; reason = "Gaining too fast"; }
-                else return new { message = "No adjustment needed" };
+                if (string.IsNullOrWhiteSpace(item.ExerciseName) && !item.ExerciseId.HasValue)
+                    continue;
+
+                var resolvedExerciseId = await ResolveOrCreateExerciseAsync(item.ExerciseId, item.ExerciseName);
+
+                _db.PlanWorkoutItems.Add(new PlanWorkoutItem
+                {
+                    PlanId = plan.PlanId,
+                    DayNo = (byte)day.DayNo,
+                    ExerciseId = resolvedExerciseId,
+                    Sets = item.Sets,
+                    Reps = item.Reps,
+                    Minutes = item.Minutes,
+                    RestSeconds = item.RestSeconds,
+                    Notes = item.Notes
+                });
+            }
+        }
+
+        await _db.SaveChangesAsync();
+
+        return new
+        {
+            message = "Customized plan saved successfully.",
+            planId = plan.PlanId,
+            planVersion = plan.PlanVersion
+        };
+    }
+
+    // ---------------------------------------------------------
+    // OLD GENERATE (still supported)
+    // ---------------------------------------------------------
+    public async Task<object> GeneratePlan(int userId, int goalId)
+    {
+        var preview = await PreviewPlan(userId, goalId);
+
+        var saveReq = new SaveCustomizedPlanReq(
+            goalId,
+            preview.CaloriesTarget,
+            preview.ProteinG,
+            preview.CarbsG,
+            preview.FatG,
+            preview.WeekPlan.Select(d => new WeekPlanDayReq(
+                d.DayNo,
+                d.DayName,
+                d.DietItems.Select(x => new PlanDietRowReq(x.MealType, x.FoodId, x.FoodName, x.Quantity, x.Notes)).ToList(),
+                d.WorkoutItems.Select(x => new PlanWorkoutRowReq(x.ExerciseId, x.ExerciseName, x.Sets, x.Reps, x.Minutes, x.RestSeconds, x.Notes)).ToList()
+            )).ToList()
+        );
+
+        return await SaveCustomizedPlan(userId, saveReq);
+    }
+
+    // ---------------------------------------------------------
+    // AUTO-ADJUST (your earlier logic can stay; unchanged)
+    // ---------------------------------------------------------
+    public async Task<object> AutoAdjust(int userId)
+    {
+        var checkins = await _db.WeeklyCheckIns
+            .Where(x => x.UserId == userId)
+            .OrderByDescending(x => x.WeekStartDate)
+            .Take(3)
+            .ToListAsync();
+
+        var activePlan = await _db.Plans.FirstOrDefaultAsync(p => p.UserId == userId && p.IsActive);
+        var profile = await _db.UserProfiles.FirstOrDefaultAsync(p => p.UserId == userId);
+        var goal = await _db.UserGoals.FirstOrDefaultAsync(g => g.UserId == userId && g.IsActive);
+
+        if (activePlan == null || profile == null || goal == null)
+            return new { message = "No active plan/profile/goal." };
+
+        if (checkins.Count < 2)
+            return new { message = "Need at least 2 weekly check-ins." };
+
+        var adherence = checkins[0].AdherenceRating ?? 0;
+        if (adherence < 6)
+            return new { message = "No adjustment (low adherence). Improve consistency first." };
+
+        var current = (double)checkins[0].WeightKg;
+        var previous = (double)checkins[1].WeightKg;
+
+        var weeklyChange = current - previous;
+        var isPlateau = Math.Abs(weeklyChange) < 0.3;
+        var tooFastLoss = (previous - current) / previous > 0.01;
+        var tooFastGain = (current - previous) / previous > 0.0075;
+
+        int delta = 0;
+        string reason;
+
+        if (goal.GoalType == "Lose")
+        {
+            if (isPlateau) { delta = -150; reason = "Plateau detected"; }
+            else if (tooFastLoss) { delta = +150; reason = "Safety: losing too fast"; }
+            else return new { message = "No adjustment needed." };
+        }
+        else if (goal.GoalType == "Gain")
+        {
+            if (tooFastGain) { delta = -100; reason = "Gaining too fast"; }
+            else return new { message = "No adjustment needed." };
+        }
+        else
+        {
+            return new { message = "No adjustment for Maintain goal." };
+        }
+
+        activePlan.IsActive = false;
+        activePlan.ValidTo = DateOnly.FromDateTime(DateTime.UtcNow);
+
+        var newCalories = ClampCalories(activePlan.CaloriesTarget + delta, profile.Gender);
+        var macros = CalcMacros(goal.GoalType, newCalories, (double)profile.WeightKg);
+
+        var newPlan = new Plan
+        {
+            UserId = userId,
+            GoalId = activePlan.GoalId,
+            PlanVersion = activePlan.PlanVersion + 1,
+            CaloriesTarget = newCalories,
+            ProteinG = macros.ProteinG,
+            FatG = macros.FatG,
+            CarbsG = macros.CarbsG,
+            Bmi = activePlan.Bmi,
+            Bmr = activePlan.Bmr,
+            Tdee = activePlan.Tdee,
+            IsActive = true,
+            ReasonForChange = reason,
+            ValidFrom = DateOnly.FromDateTime(DateTime.UtcNow)
+        };
+
+        _db.Plans.Add(newPlan);
+        await _db.SaveChangesAsync();
+
+        // regenerate default plan for adjusted calories
+        var preview = await BuildPreviewWeekPlan(profile, goal);
+        foreach (var day in preview)
+        {
+            foreach (var d in day.DietItems)
+            {
+                var foodId = await ResolveOrCreateFoodAsync(d.FoodId, d.FoodName);
+                _db.PlanDietItems.Add(new PlanDietItem
+                {
+                    PlanId = newPlan.PlanId,
+                    DayNo = (byte)day.DayNo,
+                    MealType = d.MealType,
+                    FoodId = foodId,
+                    Quantity = d.Quantity,
+                    Notes = d.Notes
+                });
+            }
+
+            foreach (var w in day.WorkoutItems)
+            {
+                var exerciseId = await ResolveOrCreateExerciseAsync(w.ExerciseId, w.ExerciseName);
+                _db.PlanWorkoutItems.Add(new PlanWorkoutItem
+                {
+                    PlanId = newPlan.PlanId,
+                    DayNo = (byte)day.DayNo,
+                    ExerciseId = exerciseId,
+                    Sets = w.Sets,
+                    Reps = w.Reps,
+                    Minutes = w.Minutes,
+                    RestSeconds = w.RestSeconds,
+                    Notes = w.Notes
+                });
+            }
+        }
+
+        await _db.SaveChangesAsync();
+
+        return new { message = "Plan adjusted", reason, newCalories };
+    }
+
+    // ---------------------------------------------------------
+    // PREVIEW BUILDERS
+    // ---------------------------------------------------------
+    private async Task<List<WeekPlanDayResp>> BuildPreviewWeekPlan(UserProfile profile, UserGoal goal)
+    {
+        var foods = await _db.FoodMaster.Where(f => f.IsActive).ToListAsync();
+        var exercises = await _db.ExerciseMaster.Where(e => e.IsActive).ToListAsync();
+
+        var proteinFoods = foods
+            .Where(f => HasTag(f.TagsCsv, "high-protein") || HasTag(f.TagsCsv, "protein"))
+            .ToList();
+
+        var carbFoods = foods
+            .Where(f => HasTag(f.TagsCsv, "carb"))
+            .ToList();
+
+        var vegFoods = foods
+            .Where(f => HasTag(f.TagsCsv, "veg") || HasTag(f.TagsCsv, "fiber") || HasTag(f.TagsCsv, "fruit"))
+            .ToList();
+
+        // Filter by diet type
+        if (profile.DietType.Equals("Veg", StringComparison.OrdinalIgnoreCase) ||
+            profile.DietType.Equals("Vegan", StringComparison.OrdinalIgnoreCase))
+        {
+            proteinFoods = proteinFoods.Where(f => !HasTag(f.TagsCsv, "nonveg")).ToList();
+        }
+
+        if (!proteinFoods.Any()) proteinFoods = foods.Take(3).ToList();
+        if (!carbFoods.Any()) carbFoods = foods.Take(3).ToList();
+        if (!vegFoods.Any()) vegFoods = foods.Take(3).ToList();
+
+        var strength = exercises.Where(e => e.ExerciseType == "Strength").ToList();
+        var cardio = exercises.Where(e => e.ExerciseType == "Cardio").ToList();
+        var mobility = exercises.Where(e => e.ExerciseType == "Mobility").ToList();
+
+        if (!strength.Any()) strength = exercises.Take(3).ToList();
+        if (!cardio.Any()) cardio = exercises.Take(2).ToList();
+        if (!mobility.Any()) mobility = exercises.Take(1).ToList();
+
+        var mealTypes = profile.MealsPerDay switch
+        {
+            <= 2 => new[] { "Lunch", "Dinner" },
+            3 => new[] { "Breakfast", "Lunch", "Dinner" },
+            _ => new[] { "Breakfast", "Lunch", "Snack", "Dinner" }
+        };
+
+        var result = new List<WeekPlanDayResp>();
+
+        for (int dayNo = 1; dayNo <= 7; dayNo++)
+        {
+            var dayName = GetDayName(dayNo);
+
+            var dietItems = new List<PlanDietRowResp>();
+            var workoutItems = new List<PlanWorkoutRowResp>();
+
+            // Diet suggestions
+            foreach (var mealType in mealTypes)
+            {
+                var carb = carbFoods[(dayNo - 1) % carbFoods.Count];
+                var protein = proteinFoods[(dayNo - 1) % proteinFoods.Count];
+                var veg = vegFoods[(dayNo - 1) % vegFoods.Count];
+
+                dietItems.Add(new PlanDietRowResp(
+                    mealType,
+                    carb.FoodId,
+                    carb.FoodName,
+                    150,
+                    null
+                ));
+
+                dietItems.Add(new PlanDietRowResp(
+                    mealType,
+                    protein.FoodId,
+                    protein.FoodName,
+                    100,
+                    null
+                ));
+
+                dietItems.Add(new PlanDietRowResp(
+                    mealType,
+                    veg.FoodId,
+                    veg.FoodName,
+                    100,
+                    null
+                ));
+            }
+
+            // Workout suggestions
+            bool isWorkoutDay = dayNo <= profile.WorkoutDaysPerWeek;
+
+            if (isWorkoutDay)
+            {
+                if (goal.GoalType == "Lose")
+                {
+                    var s1 = strength[0 % strength.Count];
+                    var s2 = strength[Math.Min(1, strength.Count - 1)];
+                    var c1 = cardio[0 % cardio.Count];
+
+                    workoutItems.Add(new PlanWorkoutRowResp(s1.ExerciseId, s1.ExerciseName, 3, 10, null, 60, null));
+                    workoutItems.Add(new PlanWorkoutRowResp(s2.ExerciseId, s2.ExerciseName, 3, 12, null, 60, null));
+                    workoutItems.Add(new PlanWorkoutRowResp(c1.ExerciseId, c1.ExerciseName, null, null, 20, null, "Finish with cardio"));
+                }
+                else if (goal.GoalType == "Gain")
+                {
+                    var s1 = strength[0 % strength.Count];
+                    var s2 = strength[Math.Min(1, strength.Count - 1)];
+                    var s3 = strength[Math.Min(2, strength.Count - 1)];
+
+                    workoutItems.Add(new PlanWorkoutRowResp(s1.ExerciseId, s1.ExerciseName, 4, 8, null, 75, null));
+                    workoutItems.Add(new PlanWorkoutRowResp(s2.ExerciseId, s2.ExerciseName, 4, 10, null, 75, null));
+                    workoutItems.Add(new PlanWorkoutRowResp(s3.ExerciseId, s3.ExerciseName, 3, 12, null, 60, null));
+                }
+                else
+                {
+                    var s1 = strength[0 % strength.Count];
+                    var c1 = cardio[0 % cardio.Count];
+
+                    workoutItems.Add(new PlanWorkoutRowResp(s1.ExerciseId, s1.ExerciseName, 3, 10, null, 60, null));
+                    workoutItems.Add(new PlanWorkoutRowResp(c1.ExerciseId, c1.ExerciseName, null, null, 15, null, "Light cardio"));
+                }
             }
             else
             {
-                return new { message = "No adjustment for Maintain goal" };
+                var m1 = mobility[0 % mobility.Count];
+                workoutItems.Add(new PlanWorkoutRowResp(m1.ExerciseId, m1.ExerciseName, null, null, 15, null, "Recovery / mobility"));
             }
 
-            // create new plan version
-            activePlan.IsActive = false;
-            activePlan.ValidTo = DateOnly.FromDateTime(DateTime.UtcNow);
-
-            var newCalories = ClampCalories(activePlan.CaloriesTarget + delta, profile.Gender);
-
-            (int p, int f, int c) = CalcMacros(goal.GoalType, newCalories, (double)profile.WeightKg);
-
-            var newPlan = new Plan
-            {
-                UserId = userId,
-                GoalId = activePlan.GoalId,
-                PlanVersion = activePlan.PlanVersion + 1,
-                CaloriesTarget = newCalories,
-                ProteinG = p,
-                FatG = f,
-                CarbsG = c,
-                Bmi = activePlan.Bmi,
-                Bmr = activePlan.Bmr,
-                Tdee = activePlan.Tdee,
-                IsActive = true,
-                ReasonForChange = reason,
-                ValidFrom = DateOnly.FromDateTime(DateTime.UtcNow)
-            };
-
-            _db.Plans.Add(newPlan);
-            await _db.SaveChangesAsync();
-
-            // regenerate items (simple approach: rebuild)
-            await GenerateWorkoutItems(newPlan.PlanId, goal.GoalType, profile.WorkoutDaysPerWeek);
-            await GenerateDietItems(newPlan.PlanId, newCalories, profile.MealsPerDay, profile.DietType);
-            await _db.SaveChangesAsync();
-
-            return new { message = "Plan adjusted", reason, newCalories };
+            result.Add(new WeekPlanDayResp(dayNo, dayName, dietItems, workoutItems));
         }
 
-        // ----- Helpers -----
+        return result;
+    }
 
-        private static int CalcAge(DateOnly dob)
-        {
-            var today = DateOnly.FromDateTime(DateTime.UtcNow);
-            var age = today.Year - dob.Year;
-            if (today < dob.AddYears(age)) age--;
-            return Math.Max(age, 10);
-        }
+    // ---------------------------------------------------------
+    // HELPERS
+    // ---------------------------------------------------------
+    private (double Bmi, int Bmr, int Tdee, int CaloriesTarget, int ProteinG, int CarbsG, int FatG) BuildPlanCalculation(UserProfile profile, UserGoal goal)
+    {
+        var age = profile.DOB.HasValue ? CalcAge(profile.DOB.Value) : 25;
+        var heightM = (double)profile.HeightCm / 100.0;
+        var bmi = (double)profile.WeightKg / (heightM * heightM);
 
-        private static double CalcBmr(string gender, double wKg, double hCm, int age)
-        {
-            var baseVal = (10 * wKg) + (6.25 * hCm) - (5 * age);
-            return gender.Equals("Female", StringComparison.OrdinalIgnoreCase) ? baseVal - 161 : baseVal + 5;
-        }
+        var bmr = CalcBmr(profile.Gender, (double)profile.WeightKg, (double)profile.HeightCm, age);
+        var tdee = (int)Math.Round(bmr * ActivityMultiplier(profile.ActivityLevel));
 
-        private static double ActivityMultiplier(string level) => level switch
+        var caloriesTarget = CalcCaloriesTarget(goal.GoalType, goal.Pace, tdee, profile.Gender);
+        var macros = CalcMacros(goal.GoalType, caloriesTarget, (double)profile.WeightKg);
+
+        return (bmi, (int)Math.Round(bmr), tdee, caloriesTarget, macros.ProteinG, macros.CarbsG, macros.FatG);
+    }
+
+    private async Task<int> ResolveOrCreateFoodAsync(int? foodId, string? foodName)
+    {
+        if (foodId.HasValue)
+            return foodId.Value;
+
+        var name = (foodName ?? "").Trim();
+        if (string.IsNullOrWhiteSpace(name))
+            throw new Exception("Food name is required.");
+
+        var existing = await _db.FoodMaster.FirstOrDefaultAsync(x => x.FoodName == name);
+        if (existing != null) return existing.FoodId;
+
+        var created = new FoodMaster
         {
-            "Sedentary" => 1.2,
-            "Light" => 1.375,
-            "Moderate" => 1.55,
-            "Active" => 1.725,
-            _ => 1.55
+            FoodName = name,
+            ServingUnit = "g",
+            CaloriesPer100 = 0,
+            ProteinPer100 = 0,
+            CarbsPer100 = 0,
+            FatPer100 = 0,
+            TagsCsv = "custom",
+            IsActive = true
         };
 
-        private static int CalcCaloriesTarget(string goalType, string pace, int tdee, string gender)
+        _db.FoodMaster.Add(created);
+        await _db.SaveChangesAsync();
+        return created.FoodId;
+    }
+
+    private async Task<int> ResolveOrCreateExerciseAsync(int? exerciseId, string? exerciseName)
+    {
+        if (exerciseId.HasValue)
+            return exerciseId.Value;
+
+        var name = (exerciseName ?? "").Trim();
+        if (string.IsNullOrWhiteSpace(name))
+            throw new Exception("Exercise name is required.");
+
+        var existing = await _db.ExerciseMaster.FirstOrDefaultAsync(x => x.ExerciseName == name);
+        if (existing != null) return existing.ExerciseId;
+
+        var created = new ExerciseMaster
         {
-            int target = goalType switch
-            {
-                "Lose" => pace switch { "Mild" => tdee - 250, "Aggressive" => tdee - 750, _ => tdee - 500 },
-                "Gain" => pace switch { "Mild" => tdee + 250, "Aggressive" => tdee + 500, _ => tdee + 400 },
-                _ => tdee
-            };
+            ExerciseName = name,
+            ExerciseType = "Strength",
+            Difficulty = "Beginner",
+            TargetMuscle = null,
+            VideoUrl = null,
+            CaloriesPerMin = null,
+            IsActive = true
+        };
 
-            // round to nearest 50
-            target = (int)(Math.Round(target / 50.0) * 50);
-            return ClampCalories(target, gender);
-        }
+        _db.ExerciseMaster.Add(created);
+        await _db.SaveChangesAsync();
+        return created.ExerciseId;
+    }
 
-        private static int ClampCalories(int calories, string gender)
+    private static bool HasTag(string? csv, string tag)
+    {
+        if (string.IsNullOrWhiteSpace(csv)) return false;
+        return csv.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                  .Any(x => x.Equals(tag, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static string GetDayName(int dayNo) => dayNo switch
+    {
+        1 => "Monday",
+        2 => "Tuesday",
+        3 => "Wednesday",
+        4 => "Thursday",
+        5 => "Friday",
+        6 => "Saturday",
+        7 => "Sunday",
+        _ => "Monday"
+    };
+
+    private static int CalcAge(DateOnly dob)
+    {
+        var today = DateOnly.FromDateTime(DateTime.UtcNow);
+        var age = today.Year - dob.Year;
+        if (today < dob.AddYears(age)) age--;
+        return Math.Max(age, 10);
+    }
+
+    private static double CalcBmr(string gender, double wKg, double hCm, int age)
+    {
+        var baseVal = (10 * wKg) + (6.25 * hCm) - (5 * age);
+        return gender.Equals("Female", StringComparison.OrdinalIgnoreCase) ? baseVal - 161 : baseVal + 5;
+    }
+
+    private static double ActivityMultiplier(string level) => level switch
+    {
+        "Sedentary" => 1.2,
+        "Light" => 1.375,
+        "Moderate" => 1.55,
+        "Active" => 1.725,
+        _ => 1.55
+    };
+
+    private static int CalcCaloriesTarget(string goalType, string pace, int tdee, string gender)
+    {
+        int target = goalType switch
         {
-            var min = gender.Equals("Female", StringComparison.OrdinalIgnoreCase) ? 1200 : 1500;
-            return Math.Max(calories, min);
-        }
+            "Lose" => pace switch { "Mild" => tdee - 250, "Aggressive" => tdee - 750, _ => tdee - 500 },
+            "Gain" => pace switch { "Mild" => tdee + 250, "Aggressive" => tdee + 500, _ => tdee + 400 },
+            _ => tdee
+        };
 
-        private static (int proteinG, int fatG, int carbsG) CalcMacros(string goalType, int caloriesTarget, double weightKg)
-        {
-            var proteinPerKg = goalType == "Gain" ? 1.8 : 1.6;
-            var fatPerKg = 0.8;
+        target = (int)(Math.Round(target / 50.0) * 50);
+        return ClampCalories(target, gender);
+    }
 
-            var proteinG = (int)Math.Round(weightKg * proteinPerKg);
-            var fatG = (int)Math.Round(weightKg * fatPerKg);
+    private static int ClampCalories(int calories, string gender)
+    {
+        var min = gender.Equals("Female", StringComparison.OrdinalIgnoreCase) ? 1200 : 1500;
+        return Math.Max(calories, min);
+    }
 
-            var usedCals = (proteinG * 4) + (fatG * 9);
-            var carbCals = Math.Max(caloriesTarget - usedCals, 0);
-            var carbsG = (int)Math.Round(carbCals / 4.0);
+    private static (int ProteinG, int FatG, int CarbsG) CalcMacros(string goalType, int caloriesTarget, double weightKg)
+    {
+        var proteinPerKg = goalType == "Gain" ? 1.8 : 1.6;
+        var fatPerKg = 0.8;
 
-            return (proteinG, fatG, carbsG);
-        }
+        var proteinG = (int)Math.Round(weightKg * proteinPerKg);
+        var fatG = (int)Math.Round(weightKg * fatPerKg);
 
-        private async Task GenerateWorkoutItems(int planId, string goalType, byte daysPerWeek)
-        {
-            // super practical: choose a few exercises from master by type
-            var strength = await _db.ExerciseMaster.Where(e => e.IsActive && e.ExerciseType == "Strength").ToListAsync();
-            var cardio = await _db.ExerciseMaster.Where(e => e.IsActive && e.ExerciseType == "Cardio").ToListAsync();
-            var mobility = await _db.ExerciseMaster.Where(e => e.IsActive && e.ExerciseType == "Mobility").ToListAsync();
+        var usedCals = (proteinG * 4) + (fatG * 9);
+        var carbCals = Math.Max(caloriesTarget - usedCals, 0);
+        var carbsG = (int)Math.Round(carbCals / 4.0);
 
-            // basic split: assign strength days first, then cardio/mobility
-            var day = 1;
-
-            int strengthDays = Math.Min(daysPerWeek, (byte)3);
-            int cardioDays = goalType == "Lose" ? Math.Max(1, daysPerWeek - strengthDays) : Math.Max(0, daysPerWeek - strengthDays);
-
-            for (int d = 0; d < strengthDays; d++, day++)
-            {
-                foreach (var ex in strength.Take(5))
-                {
-                    _db.PlanWorkoutItems.Add(new PlanWorkoutItem
-                    {
-                        PlanId = planId,
-                        DayNo = (byte)day,
-                        ExerciseId = ex.ExerciseId,
-                        Sets = 3,
-                        Reps = 10,
-                        RestSeconds = 60
-                    });
-                }
-            }
-
-            for (int d = 0; d < cardioDays; d++, day++)
-            {
-                var ex = cardio.FirstOrDefault();
-                if (ex == null) break;
-
-                _db.PlanWorkoutItems.Add(new PlanWorkoutItem
-                {
-                    PlanId = planId,
-                    DayNo = (byte)day,
-                    ExerciseId = ex.ExerciseId,
-                    Minutes = (byte)(goalType == "Lose" ? 25 : 15),
-                    Notes = "Steady pace"
-                });
-            }
-
-            // add mobility on last day (optional)
-            if (mobility.Any())
-            {
-                _db.PlanWorkoutItems.Add(new PlanWorkoutItem
-                {
-                    PlanId = planId,
-                    DayNo = 7,
-                    ExerciseId = mobility.First().ExerciseId,
-                    Minutes = 15,
-                    Notes = "Recovery & stretching"
-                });
-            }
-        }
-
-        private async Task GenerateDietItems(int planId, int caloriesTarget, byte mealsPerDay, string dietType)
-        {
-            // Very realistic for mini project: pick foods from DB by tags (not perfect nutrition, but structured)
-            var foods = await _db.FoodMaster.Where(f => f.IsActive).ToListAsync();
-
-            // naive selection buckets
-            var proteinFoods = foods.Where(f => (f.TagsCsv ?? "").Contains("high-protein", StringComparison.OrdinalIgnoreCase)
-                                             || (f.TagsCsv ?? "").Contains("protein", StringComparison.OrdinalIgnoreCase)).ToList();
-            var carbFoods = foods.Where(f => (f.TagsCsv ?? "").Contains("carb", StringComparison.OrdinalIgnoreCase)).ToList();
-            var vegFoods = foods.Where(f => (f.TagsCsv ?? "").Contains("veg", StringComparison.OrdinalIgnoreCase)
-                                         || (f.TagsCsv ?? "").Contains("fiber", StringComparison.OrdinalIgnoreCase)).ToList();
-
-            // dietType filter: if Veg, avoid nonveg tagged foods
-            if (dietType.Equals("Veg", StringComparison.OrdinalIgnoreCase) || dietType.Equals("Vegan", StringComparison.OrdinalIgnoreCase))
-            {
-                proteinFoods = proteinFoods.Where(f => !(f.TagsCsv ?? "").Contains("nonveg", StringComparison.OrdinalIgnoreCase)).ToList();
-            }
-
-            string[] mealTypes = mealsPerDay switch
-            {
-                <= 2 => new[] { "Lunch", "Dinner" },
-                3 => new[] { "Breakfast", "Lunch", "Dinner" },
-                _ => new[] { "Breakfast", "Lunch", "Snack", "Dinner" }
-            };
-
-            // allocate calories by meal (simple)
-            var splits = mealTypes.Length switch
-            {
-                2 => new[] { 0.5, 0.5 },
-                3 => new[] { 0.30, 0.40, 0.30 },
-                4 => new[] { 0.30, 0.35, 0.10, 0.25 },
-                _ => new[] { 0.25, 0.35, 0.25, 0.15 }
-            };
-
-            for (byte day = 1; day <= 7; day++)
-            {
-                for (int m = 0; m < mealTypes.Length; m++)
-                {
-                    var meal = mealTypes[m];
-                    // choose 2-3 items per meal
-                    var carb = carbFoods.FirstOrDefault();
-                    var prot = proteinFoods.FirstOrDefault();
-                    var veg = vegFoods.FirstOrDefault();
-
-                    // quantities are just demo-friendly; you can refine later
-                    if (carb != null)
-                        _db.PlanDietItems.Add(new PlanDietItem { PlanId = planId, DayNo = day, MealType = meal, FoodId = carb.FoodId, Quantity = 150 });
-
-                    if (prot != null)
-                        _db.PlanDietItems.Add(new PlanDietItem { PlanId = planId, DayNo = day, MealType = meal, FoodId = prot.FoodId, Quantity = 100 });
-
-                    if (veg != null)
-                        _db.PlanDietItems.Add(new PlanDietItem { PlanId = planId, DayNo = day, MealType = meal, FoodId = veg.FoodId, Quantity = 100 });
-                }
-            }
-        }
+        return (proteinG, fatG, carbsG);
     }
 }
